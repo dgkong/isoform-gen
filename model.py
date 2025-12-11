@@ -138,7 +138,7 @@ class PointerHead(nn.Module):
             nn.Linear(d_model, num_roles)
         )
 
-    def forward(self, x_ctx, x_suf, pos_ctx, pos_suf, role_ctx, role_tgt, mask_ctx=None, mask_suf=None, targets=None):
+    def forward(self, x_ctx, x_suf, pos_ctx, pos_suf, role_ctx, role_tgt, mask_ctx=None, mask_suf=None, targets=None, rel_abundance=None):
         B, S, _ = x_suf.shape
 
         # Encode History
@@ -169,5 +169,14 @@ class PointerHead(nn.Module):
         if mask_suf is not None:
             logits = logits.masked_fill(mask_suf == 0, float("-inf"))
 
-        loss = F.cross_entropy(logits, targets) if targets is not None else None
+        loss = None
+        if targets is not None:
+            if rel_abundance is not None:
+                loss = F.cross_entropy(logits, targets, reduction="none")
+                loss = loss * rel_abundance
+                loss = loss.mean()
+            else:
+                loss = F.cross_entropy(logits, targets)
+            
+
         return logits, logits.argmax(dim=-1), loss
