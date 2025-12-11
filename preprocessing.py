@@ -12,6 +12,7 @@ METADATA_PATH = RAW_DIR / "metadata.tsv"
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def build_file_mapping(metadata_path):
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata not found at {metadata_path}")
@@ -45,6 +46,7 @@ def build_file_mapping(metadata_path):
     
     print(f"Mapped {len(mapping)} GTF-TSV pairs from metadata.")
     return mapping
+
 
 def gtf_to_parquet(gtf_path, tsv_path, out_parquet):
     # Load GTF (Structure)
@@ -197,6 +199,7 @@ def gtf_to_parquet(gtf_path, tsv_path, out_parquet):
     Path(out_parquet).parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_parquet, compression="zstd", use_dictionary=True)
 
+
 def worker(gtf_path: Path, file_mapping: dict):
     file_id = gtf_path.name.split('.')[0]
     out_path = OUT_DIR / f"{file_id}.parquet"
@@ -219,6 +222,7 @@ def worker(gtf_path: Path, file_mapping: dict):
     gtf_to_parquet(str(gtf_path), str(tsv_path), str(out_path))
     return (str(gtf_path), str(out_path))
 
+
 def convert_sequential(in_dir: Path, metadata_path: Path, pattern: str = "*.gtf.gz"):
     mapping = build_file_mapping(metadata_path)
     paths = sorted(in_dir.glob(pattern))
@@ -235,6 +239,7 @@ def convert_sequential(in_dir: Path, metadata_path: Path, pattern: str = "*.gtf.
             tqdm.write(f"[FAIL] {p.name}: {e}")
 
     print(f"Done. Success: {ok}, Failed: {fail}")
+
 
 if __name__ == "__main__":
     convert_sequential(in_dir=RAW_DIR, metadata_path=METADATA_PATH, pattern="*.gtf.gz")

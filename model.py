@@ -16,8 +16,11 @@ class RotaryPositionalEmbedding(nn.Module):
         freqs = torch.einsum("bs,d->bsd", positions.float(), self.inv_freq)
         return freqs.cos(), freqs.sin()
 
+
 def apply_rotary_pos(x, cos, sin):
     # x: (..., D), cos, sin: (..., D/2)
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
     d = x.shape[-1] // 2
     x1 = x[..., :d]
     x2 = x[..., d:]
@@ -25,7 +28,7 @@ def apply_rotary_pos(x, cos, sin):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads=4):
+    def __init__(self, d_model, num_heads=4, dropout=0.1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
@@ -33,6 +36,8 @@ class SelfAttention(nn.Module):
         
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
 
     def forward(self, x, rope_cos, rope_sin, mask=None):
         B, L, D = x.shape
@@ -57,14 +62,16 @@ class SelfAttention(nn.Module):
             scores = scores.masked_fill(mask.view(B, 1, 1, L) == 0, float("-inf"))
             
         attn = F.softmax(scores, dim=-1)
+        attn = self.attn_drop(attn)
         # (B, H, L, D_head)
         out = torch.matmul(attn, v)
-        
         out = out.transpose(1, 2).contiguous().view(B, L, D)
-        return self.o_proj(out)
+        out = self.o_proj(out)
+        return self.proj_drop(out)
+
 
 class HistoryEncoder(nn.Module):
-    def __init__(self, input_dim, d_model, rope_module, num_layers=2):
+    def __init__(self, input_dim, d_model, rope_module, num_layers=2, dropout=0.1):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         self.rope = rope_module
@@ -79,6 +86,7 @@ class HistoryEncoder(nn.Module):
                     nn.Linear(4 * d_model, d_model)
                 ),
                 "ln2": nn.LayerNorm(d_model),
+                "drop_ffn": nn.Dropout(dropout),
             }) for _ in range(num_layers)
         ])
 
@@ -87,7 +95,7 @@ class HistoryEncoder(nn.Module):
     def forward(self, x, positions, mask=None):
         B, M, _ = x.shape
         if M == 0:
-            return self.start_state.expand(B, -1)
+            return self.start_state.to(dtype=x.dtype).expand(B, -1)
 
         x = self.input_proj(x)
         if mask is None:
@@ -107,26 +115,27 @@ class HistoryEncoder(nn.Module):
 
         for layer in self.layers:
             x_h = x_h + layer["attn"](layer["ln1"](x_h), cos_h, sin_h, mask=mask_h)
-            x_h = x_h + layer["ffn"](layer["ln2"](x_h))
+            x_h = x_h + layer["drop_ffn"](layer["ffn"](layer["ln2"](x_h)))
 
         last_idx_h = (mask_h.sum(dim=1).long() - 1).clamp(min=0)
         batch_idx_h = torch.arange(x_h.size(0), device=x.device)
         summary[has_hist] = x_h[batch_idx_h, last_idx_h]
 
         # Rows with no history get start_state
-        summary[~has_hist] = self.start_state
+        summary[~has_hist] = self.start_state.to(dtype=x.dtype)
 
         return summary
 
+
 class PointerHead(nn.Module):
-    def __init__(self, d_emb, d_model: int, num_roles: int = 4, role_dim: int = 64):
+    def __init__(self, d_emb, d_model: int, num_roles: int = 4, role_dim: int = 64, dropout=0.1):
         super().__init__()
         self.ln_s = nn.LayerNorm(d_emb)
         self.hist_role_emb = nn.Embedding(num_roles, role_dim)
         self.tgt_role_emb = nn.Embedding(num_roles, role_dim)
         
         self.rope = RotaryPositionalEmbedding(d_model)
-        self.encoder = HistoryEncoder(d_emb + role_dim, d_model, self.rope)
+        self.encoder = HistoryEncoder(d_emb + role_dim, d_model, self.rope, dropout=dropout)
         
         self.wq = nn.Linear(d_model + role_dim, d_model, bias=False)
         self.wk = nn.Linear(d_emb, d_model, bias=False)
@@ -174,9 +183,8 @@ class PointerHead(nn.Module):
             if rel_abundance is not None:
                 loss = F.cross_entropy(logits, targets, reduction="none")
                 loss = loss * rel_abundance
-                loss = loss.mean()
+                loss = loss.sum() / rel_abundance.sum()
             else:
                 loss = F.cross_entropy(logits, targets)
-            
-
+    
         return logits, logits.argmax(dim=-1), loss

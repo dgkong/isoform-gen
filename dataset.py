@@ -1,24 +1,24 @@
-# gene_iter_fixedB.py
+import random
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Iterator, Callable
-import random
+from typing import Any, Dict, Iterator, Optional
+
 import pyarrow as pa
 import pyarrow.dataset as ds
 import torch
-from torch.utils.data import IterableDataset
-
-from transformers import AutoTokenizer, AutoModelForMaskedLM
 from pyfaidx import Fasta
+from torch.utils.data import IterableDataset
+from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-
-TEST_CHROMS  = ["chr1", "chr2"]
-VAL_CHROMS   = ["chr3", "chr4"]
-
+TEST_CHROMS  = ["chr17"]
+VAL_CHROMS   = ["chr20", "chr21", "chr22"]
+ROLE2ID = {"TSS":0, "D":1, "A":2, "PAS":3}
 RC = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
 
 def reverse_complement(seq: str) -> str:
     return seq.translate(RC)[::-1]
+
 
 def split_filters_by_chroms():
     test = ds.field("chrom").isin(TEST_CHROMS)
@@ -26,55 +26,41 @@ def split_filters_by_chroms():
     train = ~(ds.field("chrom").isin(TEST_CHROMS + VAL_CHROMS))
     return train, val, test
 
-# ---------- Pointer roles ----------
-ROLE2ID = {"TSS":0, "D":1, "A":2, "PAS":3}
-PAD_ROLE = -1
 
 def _splice_sites(strand, xs, xe):
     """
-    Return [(A,pos), (D,pos), (A,pos), (D,pos), ...] in TRANSCRIPT order.
-    xs/xe are exon starts/ends in genomic ascending order.
+    Return [pos0, pos1, ...] in TRANSCRIPT order and their roles.
+    roles sequence is [TSS, D, A, D, ..., PAS].
     """
     n = len(xs)
-
-    if strand == "+":
-        order = range(n)                 # exon0, exon1, ... (transcript = genomic)
-        exon_start = lambda i: xs[i]     # A = exon start
-        exon_end   = lambda i: xe[i]     # D = exon end
-    else:
-        order = range(n - 1, -1, -1)     # exon_{n-1}, ..., exon0 (transcript reverse of genomic)
-        exon_start = lambda i: xe[i]     # on '-' strand, transcript start of exon is genomic END
-        exon_end   = lambda i: xs[i]     # on '-' strand, transcript end   of exon is genomic START
-
     roles, pos = [], []
-    for i in order:
-        roles.append(ROLE2ID["A"]); pos.append(int(exon_start(i)))  # start of exon
-        roles.append(ROLE2ID["D"]); pos.append(int(exon_end(i)))    # end   of exon
+
+    for i in range(n):
+        if strand == "+":
+            a_pos, d_pos = xs[i], xe[i]   # genomic left -> right
+        else:
+            # For '-' strand, transcript runs from higher to lower genomic coords.
+            # In transcript order, exon boundary positions are [end, start].
+            a_pos, d_pos = xe[i], xs[i]   # genomic high -> low
+
+        roles.append(ROLE2ID["A"]); pos.append(int(a_pos))
+        roles.append(ROLE2ID["D"]); pos.append(int(d_pos))
+        
+    roles[0] = ROLE2ID["TSS"]
+    roles[-1] = ROLE2ID["PAS"]
     return roles, pos
 
+
 class GeneIterableFixedB(IterableDataset):
-    """
-    Stream Parquet genes; create constant-transcripts-per-batch (tx_batch_size).
-    If a gene has >B transcripts, it spans multiple consecutive batches;
-    if it underfills, subsequent genes top off the batch.
-
-    Each yielded batch:
-        roles      : LongTensor [B, S] with PAD_ROLE = -1 where padded
-        positions  : LongTensor [B, S] locus-relative (>=0); masked where PAD
-        mask       : FloatTensor [B, S] (1.0 = valid, 0.0 = pad)
-        groups     : List[dict] per unique gene in the batch:
-                     { 'gene_key', 'indices', 'locus_embedding', 'locus_start', 'locus_end' }
-    """
-
     def __init__(
         self,
         parquet_dir: str | Path,
-        split_filter,  # pyarrow expression, e.g., ds.field("split") == "train"
+        split_filter,
         tx_batch_size: int,
         pad_bp: int = 5000,
         shuffle: bool = True,
-        max_locus_len: Optional[int] = None,
-        arrow_batch_size: int = 128,       # Arrow record-batch size
+        max_locus_len: Optional[int] = 65536,
+        arrow_batch_size: int = 128,
     ):
         super().__init__()
         self.tx_bs = int(tx_batch_size)
@@ -82,141 +68,179 @@ class GeneIterableFixedB(IterableDataset):
         self.shuffle = shuffle
         self.max_len = max_locus_len
         self.arrow_batch_size = int(arrow_batch_size)
-
-        self.dset = ds.dataset(str(parquet_dir), format="parquet")
         self.split = split_filter
 
-        self._emb_cache = OrderedDict()       # gene_key -> torch.Tensor [L, D]
+        # LRU-style cache for locus embeddings
+        self._emb_cache = OrderedDict()
 
+        # List all parquet files; we will shuffle this per epoch
+        parquet_dir = Path(parquet_dir)
+        self.parquet_paths = sorted(parquet_dir.glob("*.parquet"))
+
+        # Caduceus model
         self.model_name = "kuleshov-group/caduceus-ph_seqlen-131k_d_model-256_n_layer-16"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForMaskedLM.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+        self.model = AutoModelForMaskedLM.from_pretrained(self.model_name, trust_remote_code=True)
         self.model.eval()
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+        self.GRCh38 = Fasta("data/genome_assembly/GRCh38.primary_assembly.genome.fa")
 
-        self.human = Fasta("data/genome_assembly/GRCh38.primary_assembly.genome.fa")
+        # Caduceus embedding dim (must match PointerHead d_emb)
+        self.d_emb = 256
 
-    # --------- streaming gene iterator ---------
-
-    def _iter_genes(self) -> Iterator[Dict[str, Any]]:
+    def _iter_genes_from_file(self, path: Path, rng: random.Random) -> Iterator[Dict[str, Any]]:
         """
-        Stream genes from Parquet with bounded memory.
+        Stream genes from a single parquet file, shuffling rows within each
+        Arrow record batch.
         """
         cols = ["gene_id", "chrom", "start", "end", "strand", "transcripts"]
-        scanner = self.dset.scanner(
+        dset = ds.dataset(str(path), format="parquet")
+
+        scanner = dset.scanner(
             filter=self.split,
             columns=cols,
             use_threads=True,
             batch_size=self.arrow_batch_size,
         )
         reader = scanner.to_reader()
-
         for rb in reader:
             tbl = pa.Table.from_batches([rb])
-            rows = tbl.to_pylist()  # only this record-batch into Python
+            rows = tbl.to_pylist()
             if self.shuffle:
-                random.shuffle(rows)   # per-batch shuffle (cheap)
-            
+                rng.shuffle(rows)
             for r in rows:
                 yield r
 
     @staticmethod
     def _locus_window(s: int, e: int, pad: int) -> tuple[int, int]:
-        """Add symmetric padding to the gene window (clamped at 0)."""
         return max(0, int(s) - pad), int(e) + pad
 
-    def _tx_examples(self, g: Dict[str, Any], locus_start: int, locus_end: int) -> List[Dict[str, Any]]:
+    def _tx_examples(self, g, s, e):
         """
-        Emit one example per context site (D/A) that has a *next* site inside the locus.
-        Each example carries:
-        - context_pos: absolute coord of context site
-        - next_pos   : absolute coord of next site (D/A/PAS)
-        We filter out examples whose next site falls outside the locus (so they have no label).
+        Build per-transcript training examples.
+
+        Each transcript yields:
+          - One TSS example with empty history (if TSS is inside locus)
+          - A chain of boundary examples:
+              prev (TSS / D / A / ...)  -> next (D / A / PAS)
+        Includes per-example rel_abundance inherited from the transcript.
         """
-        out: List[Dict[str, Any]] = []
+        out = []
         strand = g["strand"]
-        tx_list = g.get("transcripts") or []
+        tx_list = g.get("transcripts")
 
         for tx in tx_list:
-            xs = list(map(int, tx["exon_starts"]))
-            xe = list(map(int, tx["exon_ends"]))
+            xs = [int(x) - 1 for x in tx["exon_starts"]]
+            xe = [int(x) - 1 for x in tx["exon_ends"]]
             if not xs or not xe or len(xs) != len(xe):
                 continue
 
             roles, pos = _splice_sites(strand, xs, xe)
+            rel_ab = float(tx.get("rel_abundance", 1.0))
 
-            for i, r in enumerate(roles):
-                if i + 1 >= len(roles):
-                    continue
+            # ---------- TSS example with empty history ----------
+            tss_abs = int(pos[0])
+            tss_role = int(roles[0])  # ROLE2ID["TSS"]
 
+            if s <= tss_abs < e:
+                if strand == "+":
+                    tss_idx = tss_abs - s
+                else:
+                    tss_idx = (e - 1) - tss_abs
+
+                L = e - s
+                if 0 <= tss_idx < L:
+                    out.append({
+                        "prev_idx": [],
+                        "prev_roles": [],
+                        "next_idx": int(tss_idx),
+                        "next_role": tss_role,
+                        "rel_abundance": rel_ab,
+                    })
+
+            # ---------- Normal chain examples (TSS -> D -> A -> ... -> PAS) ----------
+            prev_idx, prev_roles = [], []
+
+            for i in range(len(pos) - 1):
                 ctx_abs = int(pos[i])
                 nxt_abs = int(pos[i + 1])
+                curr_role = roles[i]
+                nxt_role  = roles[i + 1]
 
-                # ensure both context and next are inside the locus window
-                # context must be inside [locus_start, locus_end)
-                if not (locus_start <= ctx_abs < locus_end):
+                if not (s <= ctx_abs < e and s <= nxt_abs < e):
                     continue
-                # next site must land in the *suffix* (strictly after context)
-                if not (locus_start <= nxt_abs < locus_end):
+
+                if strand == "+":
+                    ctx_idx = ctx_abs - s
+                    nxt_idx = nxt_abs - s
+                else:
+                    ctx_idx = (e - 1) - ctx_abs
+                    nxt_idx = (e - 1) - nxt_abs
+
+                if nxt_idx <= ctx_idx:
                     continue
+
+                prev_idx.append(int(ctx_idx))
+                prev_roles.append(int(curr_role))
 
                 out.append({
-                    "context_pos": ctx_abs,
-                    "next_pos": nxt_abs,
+                    "prev_idx": prev_idx.copy(),
+                    "prev_roles": prev_roles.copy(),
+                    "next_idx": int(nxt_idx),
+                    "next_role": int(nxt_role),
+                    "rel_abundance": rel_ab,
                 })
 
         return out
 
-    # --------- main iterator (batches of transcripts) ---------
-
     def __iter__(self):
         """
-        Stream fixed-size transcript batches with carry-over between genes.
+        per-epoch file-level shuffle + in-batch row shuffle.
         """
-        carry: List[Dict[str, Any]] = []
-        carry_gene_keys: List[Any] = []
+        rng = random.Random()
+        file_list = self.parquet_paths[:]
 
-        for g in self._iter_genes():
-            chrom, strand = g["chrom"], g["strand"]
-            gs, ge = int(g["start"]), int(g["end"])
-            s, e = self._locus_window(gs, ge, self.pad)
-            if self.max_len is not None and (e - s) > self.max_len:
-                continue
+        if self.shuffle:
+            rng.shuffle(file_list)
 
-            txs = self._tx_examples(g, s, e)
-            if not txs:
-                continue
+        carry = []
+        carry_gene_keys = []
 
-            gene_key = (g["gene_id"], chrom, strand, s, e)
+        for path in file_list:
+            for g in self._iter_genes_from_file(path, rng):
+                chrom, strand = g["chrom"], g["strand"]
+                gs, ge = int(g["start"]) - 1, int(g["end"])
+                s, e = self._locus_window(gs, ge, self.pad)
+                if self.max_len is not None and (e - s) > self.max_len:
+                    continue
 
-            # enqueue this gene's transcripts
-            for t in txs:
-                carry.append(t)
-                carry_gene_keys.append(gene_key)
+                txs = self._tx_examples(g, s, e)
+                if not txs:
+                    continue
 
-            # emit as many full batches as possible
-            while len(carry) >= self.tx_bs:
-                batch_items = carry[: self.tx_bs]
-                batch_gkeys = carry_gene_keys[: self.tx_bs]
-                carry = carry[self.tx_bs :]
-                carry_gene_keys = carry_gene_keys[self.tx_bs :]
-                yield self._pack_batch(batch_items, batch_gkeys)
+                # Cache key: (chrom, strand, s, e, gene_id)
+                gene_key = (chrom, strand, s, e, g["gene_id"])
+                for t in txs:
+                    carry.append(t)
+                    carry_gene_keys.append(gene_key)
 
-        # final partial batch (keep it; comment out to drop)
+                while len(carry) >= self.tx_bs:
+                    batch_items = carry[: self.tx_bs]
+                    batch_gkeys = carry_gene_keys[: self.tx_bs]
+                    carry = carry[self.tx_bs :]
+                    carry_gene_keys = carry_gene_keys[self.tx_bs :]
+                    yield self._pack_batch(batch_items, batch_gkeys)
+
         if carry:
             yield self._pack_batch(carry, carry_gene_keys)
 
     @torch.no_grad()
     def _embed_locus(self, key):
         """
-        Return a CPU tensor [L, D] of Caduceus embeddings over [s, e) on `chrom`.
-        - No reverse-complement averaging.
-        - Embeddings are aligned to forward genomic coordinates (index 0 -> s).
+        Embed a locus with Caduceus and store as float16 on CPU.
         """
-        gene_id, chrom, strand, s, e = key
-        # LRU cache
+        chrom, strand, s, e, gene_id = key
         if key in self._emb_cache:
             emb = self._emb_cache.pop(key)
             self._emb_cache[key] = emb
@@ -224,106 +248,103 @@ class GeneIterableFixedB(IterableDataset):
 
         L = int(e) - int(s)
         if L <= 0:
-            return torch.zeros(0, 256)
+            # zero-length locus: return empty fp16 tensor
+            return torch.zeros(0, self.d_emb, dtype=torch.float16)
 
-        # fetch sequence
-        seq = str(self.human[chrom][s:e])
-
+        seq = str(self.GRCh38[chrom][s:e])
         if strand == "-":
             seq = reverse_complement(seq)
 
-        # tokenize & run model
         tokens = self.tokenizer(seq, return_tensors="pt", add_special_tokens=False).to(self.device)
         out = self.model(**tokens, output_hidden_states=True)
-        h = out.hidden_states[-1].squeeze(0)    # [L, D]
+        # store as fp16 on CPU to save memory
+        h = out.hidden_states[-1].squeeze(0).detach().to("cpu", dtype=torch.float16)  # [L, D_emb]
 
-        if strand == "-":
-            # Flip back so index 0 still corresponds to genomic s
-            h = torch.flip(h, dims=[0])
-
-        emb = h.detach().cpu()                  # keep CPU for downstream batching
-
-        # tiny LRU (≤ batch size)
-        self._emb_cache[key] = emb
+        self._emb_cache[key] = h
         if len(self._emb_cache) > self.tx_bs:
             self._emb_cache.popitem(last=False)
+        return h
 
-        return emb
-
-    # --------- batch assembly ---------
-    def _pack_batch(
-        self,
-        items: List[Dict[str, Any]],
-        gkeys: List[Any],
-    ) -> Dict[str, Any]:
-        """
-        Assemble a minibatch for *next-site position* prediction:
-        - X_context:  [B, D]  embedding at context site
-        - X_suffix:   [B, S, D] embeddings from context+1 .. locus_end (padded)
-        - suffix_mask:[B, S]
-        - target_idx: [B] index in 0..S-1 of the next site within the suffix
-        """
+    def _pack_batch(self, items, gkeys):
         B = len(items)
-
-        # Compute per-item relative indices and suffix lengths
-        ctx_rel_idx = torch.empty(B, dtype=torch.long)
-        tgt_rel_idx = torch.empty(B, dtype=torch.long)
-        suffix_lengths: List[int] = []
-
+        ctx_lengths, suffix_lengths = [], []
+        tgt_idx = torch.empty(B, dtype=torch.long)
+        rel_ab = torch.empty(B, dtype=torch.float32)
+        
+        # 1. Pre-scan for dimensions
         for i, (it, key) in enumerate(zip(items, gkeys)):
-            # key = (gene_id, chrom, strand, s, e)
-            _, _, strand, s, e = key
-            s, e = int(s), int(e)
-            L = e - s
+            chrom, strand, s, e, gene_id = key
+            L = int(e) - int(s)
 
-            ctx_rel = int(it["context_pos"]) - s
-            nxt_rel = int(it["next_pos"]) - s
+            prev_idx = it["prev_idx"]
+            ctx_len = len(prev_idx)
+            ctx_lengths.append(ctx_len)
 
-            if strand == "+":
-                # suffix runs rightward
-                tgt_idx = nxt_rel - (ctx_rel + 1)
-                suffix_len = L - (ctx_rel + 1)
+            if ctx_len > 0:
+                c = int(prev_idx[-1])
             else:
-                # suffix runs leftward, toward smaller genomic coords
-                tgt_idx = (ctx_rel - 1) - nxt_rel
-                suffix_len = ctx_rel  # suffix length = number of bp leftward
+                c = -1
 
-            ctx_rel_idx[i] = ctx_rel
-            tgt_rel_idx[i] = tgt_idx
-            suffix_lengths.append(suffix_len)
+            n = int(it["next_idx"])
 
+            tgt_idx[i] = n - (c + 1)
+            suffix_lengths.append(L - (c + 1))
+            rel_ab[i] = float(it.get("rel_abundance", 1.0))
+
+        max_ctx = max(ctx_lengths) if ctx_lengths else 0
         S = max(suffix_lengths)
+        D = self.d_emb
 
-        # Infer D
-        D = 256
+        # 2. Allocate Tensors (embeddings in fp16)
+        X_context     = torch.zeros(B, max_ctx, D, dtype=torch.float16)
+        context_pos   = torch.zeros(B, max_ctx, dtype=torch.long)
+        context_roles = torch.zeros(B, max_ctx, dtype=torch.long)
+        context_mask  = torch.zeros(B, max_ctx, dtype=torch.float32)
+        
+        X_suffix    = torch.zeros(B, S, D, dtype=torch.float16)
+        suffix_pos  = torch.zeros(B, S, dtype=torch.long)
+        suffix_mask = torch.zeros(B, S, dtype=torch.float32)
+        
+        target_role = torch.zeros(B, dtype=torch.long)
 
-        X_context = torch.empty(B, D)
-        X_suffix  = torch.zeros(B, S, D)
-        suffix_mask = torch.zeros(B, S)
-        target_idx = tgt_rel_idx.clone()  # [B]
+        # 3. Fill
+        for i, (it, key, ctx_len, suf_len) in enumerate(
+            zip(items, gkeys, ctx_lengths, suffix_lengths)
+        ):
+            emb = self._embed_locus(key)  # (L, D_emb) in fp16
+            prev_idx = it["prev_idx"]
 
-        for i, (key, ctx_idx, slen) in enumerate(zip(gkeys, ctx_rel_idx.tolist(), suffix_lengths)):
-            emb = self._embed_locus(key)  # [L, D]
-            _, _, strand, s, e = key
-            idx = int(ctx_idx)
+            if ctx_len > 0:
+                c = int(prev_idx[-1])
+            else:
+                c = -1
 
-            # context embedding
-            X_context[i] = emb[idx]
+            if ctx_len > 0:
+                ctx_indices_t = torch.tensor(prev_idx, dtype=torch.long)
+                X_context[i, :ctx_len] = emb[ctx_indices_t]
+                context_pos[i, :ctx_len] = ctx_indices_t
+                context_roles[i, :ctx_len] = torch.tensor(it["prev_roles"], dtype=torch.long)
+                context_mask[i, :ctx_len] = 1.0
 
-            if slen > 0:
-                if strand == "+":
-                    seg = emb[idx + 1 : idx + 1 + slen]        # rightward
-                else:
-                    left = max(0, idx - slen)
-                    seg = emb[left : idx]                       # leftward slice
-                    seg = torch.flip(seg, dims=[0])             # make suffix[0] nearest to context
-                X_suffix[i, :slen] = seg
-                suffix_mask[i, :slen] = 1
+            if suf_len > 0:
+                seg = emb[c + 1 : c + 1 + suf_len]
+                X_suffix[i, :suf_len] = seg
+                suffix_pos[i, :suf_len] = torch.arange(
+                    c + 1, c + 1 + suf_len, dtype=torch.long
+                )
+                suffix_mask[i, :suf_len] = 1.0
 
+            target_role[i] = it["next_role"]
 
         return {
-            "X_context": X_context,       # [B, D]
-            "X_suffix": X_suffix,         # [B, S, D]
-            "suffix_mask": suffix_mask,   # [B, S]
-            "target_idx": target_idx,     # [B], 0..S-1
+            "X_context":      X_context,      # (B, M, D_emb) fp16
+            "context_pos":    context_pos,    # (B, M)
+            "context_roles":  context_roles,  # (B, M)
+            "context_mask":   context_mask,   # (B, M) fp32
+            "X_suffix":       X_suffix,       # (B, S, D_emb) fp16
+            "suffix_pos":     suffix_pos,     # (B, S)
+            "suffix_mask":    suffix_mask,    # (B, S) fp32
+            "target_idx":     tgt_idx,        # (B,)
+            "target_role":    target_role,    # (B,)
+            "rel_abundance":  rel_ab,         # (B,) fp32
         }
