@@ -4,6 +4,7 @@ import time
 import torch
 from torch.utils.data import DataLoader
 
+from baseline_model import BaselinePointerHead
 from dataset import GeneIterableFixedB, split_filters_by_chroms
 from model import PointerHead
 
@@ -54,7 +55,7 @@ val_dataset = GeneIterableFixedB(
     split_filter=val_filter,
     tx_batch_size=TX_BATCH_SIZE,
     pad_bp=5000,
-    shuffle=True,
+    shuffle=False,
 )
 
 train_loader = DataLoader(train_dataset, batch_size=None)
@@ -68,6 +69,15 @@ model = PointerHead(
     role_dim=64,
     dropout=0.1,
 ).to(device)
+
+# baseline model
+# model = BaselinePointerHead(
+#     d_emb=256,
+#     d_model=512,
+#     num_roles=4,
+#     role_dim=64,
+#     dropout=0.1,
+# ).to(device)
 
 def create_optimizer(model, lr=LR, weight_decay=WEIGHT_DECAY):
     decay, no_decay = [], []
