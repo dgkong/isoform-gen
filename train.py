@@ -26,7 +26,7 @@ GRAD_ACCUM_STEPS = 16
 LR = 2e-4
 WEIGHT_DECAY = 1e-3
 CLIP_NORM = 1.0
-RESUME_TRAINING = True
+RESUME_TRAINING = False
 
 LOG_FILE = os.path.join(CHECKPOINT_DIR, "log.txt")
 if not RESUME_TRAINING:
@@ -62,22 +62,22 @@ train_loader = DataLoader(train_dataset, batch_size=None)
 val_loader = DataLoader(val_dataset, batch_size=None)
 
 # model
-model = PointerHead(
-    d_emb=256,
-    d_model=512,
-    num_roles=4,
-    role_dim=64,
-    dropout=0.1,
-).to(device)
-
-# baseline model
-# model = BaselinePointerHead(
+# model = PointerHead(
 #     d_emb=256,
 #     d_model=512,
 #     num_roles=4,
 #     role_dim=64,
 #     dropout=0.1,
 # ).to(device)
+
+# baseline model
+model = BaselinePointerHead(
+    d_emb=256,
+    d_model=512,
+    num_roles=4,
+    role_dim=64,
+    dropout=0.1,
+).to(device)
 
 def create_optimizer(model, lr=LR, weight_decay=WEIGHT_DECAY):
     decay, no_decay = [], []
