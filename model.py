@@ -150,6 +150,9 @@ class PointerHead(nn.Module):
     def forward(self, x_ctx, x_suf, pos_ctx, pos_suf, role_ctx, role_tgt, mask_ctx=None, mask_suf=None, targets=None, rel_abundance=None):
         B, S, _ = x_suf.shape
 
+        x_suf = x_suf.to(self.ln_s.weight.dtype)
+        x_ctx = x_ctx.to(self.ln_s.weight.dtype)
+
         # Encode History
         h_emb = self.hist_role_emb(role_ctx)
         summary = self.encoder(torch.cat([x_ctx, h_emb], dim=-1), pos_ctx, mask_ctx)

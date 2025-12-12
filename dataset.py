@@ -252,6 +252,11 @@ class GeneIterableFixedB(IterableDataset):
             return torch.zeros(0, self.d_emb, dtype=torch.float16)
 
         seq = str(self.GRCh38[chrom][s:e])
+        if len(seq) != (e - s):
+            raise RuntimeError(
+                f"FASTA slice truncated: chrom={chrom} s={s} e={e} "
+                f"requested={e-s} got={len(seq)}"
+            )
         if strand == "-":
             seq = reverse_complement(seq)
 

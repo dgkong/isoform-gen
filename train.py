@@ -2,7 +2,6 @@ import os
 import time
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import GeneIterableFixedB, split_filters_by_chroms
@@ -12,15 +11,13 @@ PARQUET_DIR = "data/table"
 CHECKPOINT_DIR = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-LOG_FILE = os.path.join(CHECKPOINT_DIR, "log.txt")
-if os.path.exists(LOG_FILE):
-    open(LOG_FILE, "w").close()
-
-MAX_STEPS = 200_000
+MAX_STEPS = 100_000
 VAL_INTERVAL = 500
 VAL_STEPS = 100
 PATIENCE = 10
 MIN_DELTA = 1e-4
+
+CHECKPOINT_INTERVAL = 250
 
 TX_BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 16
@@ -28,7 +25,11 @@ GRAD_ACCUM_STEPS = 16
 LR = 2e-4
 WEIGHT_DECAY = 1e-3
 CLIP_NORM = 1.0
-RESUME_TRAINING = False
+RESUME_TRAINING = True
+
+LOG_FILE = os.path.join(CHECKPOINT_DIR, "log.txt")
+if not RESUME_TRAINING:
+    open(LOG_FILE, "w").close()
 
 # device
 if torch.cuda.is_available():
@@ -36,8 +37,6 @@ if torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 print(f"using device: {device}")
-
-use_amp = device.type == "cuda"
 
 # data
 train_filter, val_filter, test_filter = split_filters_by_chroms()
@@ -88,12 +87,13 @@ def create_optimizer(model, lr=LR, weight_decay=WEIGHT_DECAY):
 optimizer = create_optimizer(model)
 
 # checkpoints
-def save_checkpoint(path, step, model, optimizer, best_val_loss):
+def save_checkpoint(path, step, model, optimizer, best_val_loss, patience_counter):
     state = {
         "step": step,
         "model": model.state_dict(),
         "optim": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
+        "patience": patience_counter
     }
     torch.save(state, path)
 
@@ -104,7 +104,8 @@ def load_checkpoint(path, model, optimizer):
     optimizer.load_state_dict(state["optim"])
     step = state.get("step", 0)
     best_val_loss = state.get("best_val_loss", float("inf"))
-    return step, best_val_loss
+    patience = state.get("patience", 0)
+    return step, best_val_loss, patience
 
 # validation
 def run_validation():
@@ -122,19 +123,18 @@ def run_validation():
 
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                _, _, loss = model(
-                    x_ctx=batch["X_context"],
-                    x_suf=batch["X_suffix"],
-                    pos_ctx=batch["context_pos"],
-                    pos_suf=batch["suffix_pos"],
-                    role_ctx=batch["context_roles"],
-                    role_tgt=batch["target_role"],
-                    mask_ctx=batch["context_mask"],
-                    mask_suf=batch["suffix_mask"],
-                    targets=batch["target_idx"],
-                    rel_abundance=batch["rel_abundance"],
-                )
+            _, _, loss = model(
+                x_ctx=batch["X_context"],
+                x_suf=batch["X_suffix"],
+                pos_ctx=batch["context_pos"],
+                pos_suf=batch["suffix_pos"],
+                role_ctx=batch["context_roles"],
+                role_tgt=batch["target_role"],
+                mask_ctx=batch["context_mask"],
+                mask_suf=batch["suffix_mask"],
+                targets=batch["target_idx"],
+                rel_abundance=batch["rel_abundance"],
+            )
 
             total_loss += loss.item()
             steps += 1
@@ -150,13 +150,17 @@ global_step = 0
 if RESUME_TRAINING:
     latest_path = os.path.join(CHECKPOINT_DIR, "latest.pt")
     if os.path.isfile(latest_path):
-        global_step, best_val_loss = load_checkpoint(latest_path, model, optimizer)
-        print(f"resumed from step {global_step}, best_val_loss {best_val_loss:.6f}")
+        global_step, best_val_loss, patience_counter = load_checkpoint(latest_path, model, optimizer)
+        print(f"resumed from step {global_step}, patience {patience_counter}, best_val_loss {best_val_loss:.6f}")
 
 train_iter = iter(train_loader)
 print(f"starting training for {MAX_STEPS} optimizer steps")
 
 while global_step < MAX_STEPS:
+    if global_step > 0 and global_step % CHECKPOINT_INTERVAL == 0:
+        latest_path = os.path.join(CHECKPOINT_DIR, "latest.pt")
+        save_checkpoint(latest_path, global_step, model, optimizer, best_val_loss, patience_counter)
+        
     if global_step > 0 and global_step % VAL_INTERVAL == 0:
         val_loss = run_validation()
         print(f"step {global_step:6d}/{MAX_STEPS} | val_loss {val_loss:.6f}")
@@ -169,13 +173,10 @@ while global_step < MAX_STEPS:
             patience_counter = 0
             best_path = os.path.join(CHECKPOINT_DIR, "best.pt")
             print("validation improved, saving best checkpoint")
-            save_checkpoint(best_path, global_step, model, optimizer, best_val_loss)
+            save_checkpoint(best_path, global_step, model, optimizer, best_val_loss, patience_counter)
         else:
             patience_counter += 1
             print(f"no improvement, patience {patience_counter}/{PATIENCE}")
-
-        latest_path = os.path.join(CHECKPOINT_DIR, "latest.pt")
-        save_checkpoint(latest_path, global_step, model, optimizer, best_val_loss)
 
         if patience_counter >= PATIENCE:
             print("early stopping")
@@ -194,21 +195,25 @@ while global_step < MAX_STEPS:
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            _, _, loss = model(
-                x_ctx=batch["X_context"],
-                x_suf=batch["X_suffix"],
-                pos_ctx=batch["context_pos"],
-                pos_suf=batch["suffix_pos"],
-                role_ctx=batch["context_roles"],
-                role_tgt=batch["target_role"],
-                mask_ctx=batch["context_mask"],
-                mask_suf=batch["suffix_mask"],
-                targets=batch["target_idx"],
-                rel_abundance=batch["rel_abundance"],
-            )
-            
-            loss = loss / GRAD_ACCUM_STEPS
+        _, _, loss = model(
+            x_ctx=batch["X_context"],
+            x_suf=batch["X_suffix"],
+            pos_ctx=batch["context_pos"],
+            pos_suf=batch["suffix_pos"],
+            role_ctx=batch["context_roles"],
+            role_tgt=batch["target_role"],
+            mask_ctx=batch["context_mask"],
+            mask_suf=batch["suffix_mask"],
+            targets=batch["target_idx"],
+            rel_abundance=batch["rel_abundance"],
+        )
+        
+        loss = loss / GRAD_ACCUM_STEPS
+
+
+        if not torch.isfinite(loss):
+            print(f"[ERROR] Non-finite loss at step {global_step}, micro {micro_step}: {loss.item()}")
+            raise SystemExit
 
         loss.backward()
         loss_accum += loss.item()
@@ -230,4 +235,4 @@ while global_step < MAX_STEPS:
 
 final_path = os.path.join(CHECKPOINT_DIR, "final.pt")
 print(f"training finished, saving final checkpoint to {final_path}")
-save_checkpoint(final_path, global_step, model, optimizer, best_val_loss)
+save_checkpoint(final_path, global_step, model, optimizer, best_val_loss, patience_counter)
