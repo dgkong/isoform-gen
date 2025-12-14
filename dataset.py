@@ -21,9 +21,11 @@ def reverse_complement(seq: str) -> str:
 
 
 def split_filters_by_chroms():
-    test = ds.field("chrom").isin(TEST_CHROMS)
-    val = ds.field("chrom").isin(VAL_CHROMS)
-    train = ~(ds.field("chrom").isin(TEST_CHROMS + VAL_CHROMS))
+    not_mito = ds.field("chrom") != "chrM"
+    
+    test = ds.field("chrom").isin(TEST_CHROMS) & not_mito
+    val = ds.field("chrom").isin(VAL_CHROMS) & not_mito
+    train = ~(ds.field("chrom").isin(TEST_CHROMS + VAL_CHROMS)) & not_mito
     return train, val, test
 
 
