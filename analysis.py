@@ -28,7 +28,7 @@ SUFFIX_BINS = [0, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 24576, 32768, 65
 # bucket edges (num splice sites) for context length
 CTX_BINS = [0, 2, 5, 9, 17, 10**9]
 
-OUT_DIR = "analysis_out"
+OUT_DIR = "analysis"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 parquets = sorted(Path(PARQUET_DIR).glob("*.parquet"))
@@ -54,6 +54,7 @@ def eval_overall_weighted_and_bins_unweighted(model, loader, suffix_bins, ctx_bi
 
     n_suf = len(suffix_bins) - 1
     n_ctx = len(ctx_bins) - 1
+    n_roles = 4
 
     overall_wsum = 0.0
     overall_w = 0.0
@@ -63,6 +64,9 @@ def eval_overall_weighted_and_bins_unweighted(model, loader, suffix_bins, ctx_bi
 
     ctx_sum = np.zeros(n_ctx, dtype=np.float64)
     ctx_cnt = np.zeros(n_ctx, dtype=np.int64)
+
+    role_sum = np.zeros(n_roles, dtype=np.float64)
+    role_cnt = np.zeros(n_roles, dtype=np.int64)
 
     for batch_i, batch in enumerate(loader, start=1):
         if batch_i % 10 == 0:
@@ -85,6 +89,7 @@ def eval_overall_weighted_and_bins_unweighted(model, loader, suffix_bins, ctx_bi
 
         targets = batch["target_idx"]
         weights = batch["rel_abundance"].float()
+        roles   = batch["target_role"].long().cpu().numpy()
 
         per_ex = F.cross_entropy(logits, targets, reduction="none")
 
@@ -98,11 +103,14 @@ def eval_overall_weighted_and_bins_unweighted(model, loader, suffix_bins, ctx_bi
         suf_bin = bucketize_np(suf_len, suffix_bins)
         ctx_bin = bucketize_np(ctx_len, ctx_bins)
 
-        for bs, bc, l in zip(suf_bin, ctx_bin, loss_np):
+        for bs, bc, r, l in zip(suf_bin, ctx_bin, roles, loss_np):
             suf_sum[bs] += float(l)
             suf_cnt[bs] += 1
             ctx_sum[bc] += float(l)
             ctx_cnt[bc] += 1
+
+            if 0 <= r < n_roles:
+                role_sum[r] += float(l); role_cnt[r] += 1
 
     overall_weighted_loss = overall_wsum / max(overall_w, 1e-12)
 
@@ -114,6 +122,9 @@ def eval_overall_weighted_and_bins_unweighted(model, loader, suffix_bins, ctx_bi
         "ctx_labels": bin_labels(ctx_bins),
         "ctx_count": ctx_cnt,
         "ctx_unweighted_mean_loss": ctx_sum / np.maximum(ctx_cnt, 1),
+        "role_labels": ["TSS", "D", "A", "PAS"],
+        "role_count": role_cnt,
+        "role_unweighted_mean_loss": role_sum / np.maximum(role_cnt, 1),
     }
 
 
@@ -135,6 +146,15 @@ def save_single_model_bins(run_name, stats, out_dir=OUT_DIR):
         }
     )
     df_ctx.to_csv(os.path.join(out_dir, f"{run_name}_context_bins.csv"), index=False)
+
+    df_role = pd.DataFrame(
+        {
+            "target_role": stats["role_labels"],
+            "n": np.asarray(stats["role_count"], dtype=int),
+            "unweighted_mean_loss": np.asarray(stats["role_unweighted_mean_loss"], dtype=float),
+        }
+    )
+    df_role.to_csv(os.path.join(out_dir, f"{run_name}_role_losses.csv"), index=False)
 
     summary = pd.DataFrame(
         [
@@ -201,5 +221,3 @@ save_single_model_bins("history", history_stats, OUT_DIR)
 print("history overall weighted loss:", history_stats["overall_weighted_loss"])
 
 print("\nDone. Wrote CSVs to:", OUT_DIR)
-print("  baseline_summary.csv / baseline_suffix_bins.csv / baseline_context_bins.csv")
-print("  history_summary.csv  / history_suffix_bins.csv  / history_context_bins.csv")
